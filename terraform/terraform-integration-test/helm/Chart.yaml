@@ -1,0 +1,5 @@
+apiVersion: v2
+name: helm-demo-ms-app
+description: A Helm chart for helm deployment of a Microservices based application
+version: 0.1.0
+appVersion: 1.0

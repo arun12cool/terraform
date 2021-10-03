@@ -1,0 +1,344 @@
+#!/usr/bin/env groovy
+package paas
+
+
+pipeline {
+    agent{
+      docker{
+        image 'recr/devops/terraform-base-image:latest'
+        label "dind"
+        }
+    }
+    
+    options {
+      skipDefaultCheckout()
+      disableConcurrentBuilds()
+      buildDiscarder(logRotator(artifactDaysToKeepStr: '1', artifactNumToKeepStr: '1', numToKeepStr: '30'))
+    }
+
+    environment{
+        def region         =  'us-west-2'
+        def cluster        =  'test-staging'
+        def bucket         =  'test-staging'
+        def key            =  'kubernetes/development/test-staging'
+        def file           =  'config'   
+        def acc            =  'acc-id'
+        def path           =  'us-west-2/development/test-staging'
+    }
+
+    
+    stages {
+        stage('Prebuild Requirements'){
+            
+            steps{
+                script{
+                    checkout scm
+					stash includes: '**', name: 'repo'
+                    unstash 'repo'
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: "tedt-key", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh '''
+                        pwd
+                        cd us-west-2/development/"${cluster}"
+                        chmod +x packages.sh
+                        ./packages.sh
+                        export AWS_REGION=us-west-2
+                        object_exists=$(aws s3api head-object --bucket "${bucket}" --key "${key}"/"${file}"  || true)
+                        if [ -z "$object_exists" ]; then
+                          echo "config does not exist in s3, it could be a new cluster :)"
+                        else
+                          echo "config exists in s3 path : "${key}" "
+                          mkdir ~/.kube
+                          aws s3 cp s3://"${bucket}"/"${key}"/config ~/.kube/config
+                        fi
+                        
+                        '''
+    
+                    }
+                    
+                }
+            }
+        }
+         stage('terraform init'){
+            
+            steps{
+                script{
+                    checkout scm
+					stash includes: '**', name: 'repo'
+                    unstash 'repo'
+                    withCredentials([usernamePassword(credentialsId: 'github-token', passwordVariable: 'git_pass', usernameVariable: 'git_user')]) {
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: "tedt-key", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh ''' 
+                        git config --global credential.helper store
+                        echo "https://"${git_user}":"${git_pass}"@github.com" > ~/.git-credentials
+                        cat ~/.git-credentials
+                        cd us-west-2/development/"${cluster}"
+                        pwd
+                        export AWS_REGION=us-west-2
+                        terraform init -no-color 
+                       
+                        '''
+    
+                    }
+                    }
+                }
+            }
+        }
+        stage('terraform plan'){
+            when {
+                beforeAgent true
+                expression {
+                    params.Plan == "apply"
+                }
+            }
+            steps{
+                script{
+                    
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: "tedt-key", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh '''
+                        pwd
+                        
+                        cd us-west-2/development/"${cluster}"
+                        export AWS_REGION=us-west-2
+                        terraform plan -target module.k8s-cluster -no-color
+                        '''
+    
+                    }
+                    
+                }
+            }
+        }
+        stage('approval for apply - k8s-cluster') {
+            
+            when {
+                beforeAgent true
+                expression {
+                    params.Plan == "apply"
+                }
+            }
+            options {
+                timeout(time: 1, unit: 'HOURS')
+            }
+            steps {
+                input 'approve the plan to proceed and apply'
+            }
+        }
+        stage('terraform apply'){
+            when {
+                beforeAgent true
+                expression {
+                    params.Plan == "apply"
+                }
+            }
+            
+            steps{
+                script{
+                    
+                    withCredentials([usernamePassword(credentialsId: 'github-token', passwordVariable: 'git_pass', usernameVariable: 'git_user')]) {
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: "tedt-key", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh '''
+                        pwd
+                        cd us-west-2/development/"${cluster}"
+                        export AWS_REGION=us-west-2
+                        export KUBECONFIG=~/.kube/config
+                        terraform apply -target module.k8s-cluster -parallelism=1 --auto-approve -no-color
+                        '''
+    
+                    }
+                    }
+                }
+            }
+        }
+
+        stage('approval for apply - rbac') {
+            
+            when {
+                beforeAgent true
+                expression {
+                    params.Plan == "rbac-apply"
+                }
+            }
+            options {
+                timeout(time: 1, unit: 'HOURS')
+            }
+            steps {
+                input 'approve the plan to proceed and apply'
+            }
+        }
+        stage('terraform rbac apply'){
+            when {
+                beforeAgent true
+                expression {
+                    params.Plan == "rbac-apply"
+                }
+            }
+            
+            steps{
+                script{
+                    
+                    withCredentials([usernamePassword(credentialsId: 'github-token', passwordVariable: 'git_pass', usernameVariable: 'git_user')]) {
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: "tedt-key", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh '''
+                        pwd
+                        cd us-west-2/development/"${cluster}"
+                        export AWS_REGION=us-west-2
+                        aws s3 cp s3://"${bucket}"/"${key}"/config ~/.kube/config
+                        export KUBECONFIG=~/.kube/config
+                        kubectl get namespace |awk '{print $1}' |grep -v NAME > old_ns
+                        kubectl get clusterroles --all-namespaces | awk '{print $1}' |grep -v NAME > old_cluster_roles
+                        kubectl get clusterrolebinding | awk '{print $1}' |grep -v NAME > old_cluster_binding
+                        kubectl get rolebinding --all-namespaces | awk '{print $2}' |grep -v NAME > old_namespace_roles
+                        ls -lrt
+                        terraform plan -target module.namespaces
+                        terraform apply -target module.namespaces -parallelism=1 --auto-approve -no-color
+                        kubectl config view --minify
+                        '''
+    
+                    }
+                    }
+                }
+            }
+        }
+        stage('push kube config to s3'){
+            when {
+                beforeAgent true
+                expression {
+                    params.Plan == "apply" ||
+                    params.Plan == "rbac-apply"
+                }
+            }
+            steps{
+                script{
+                    
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: "tedt-key", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh '''
+                        pwd
+                        export AWS_REGION=us-west-2
+                        aws s3 cp ~/.kube/config s3://"${bucket}"/"${key}"/
+                        '''
+
+                    }
+                }
+            }
+        }
+        stage('Post Sanity Check'){
+            when {
+                beforeAgent true
+                expression {
+                    params.Plan == "rbac-apply"
+                }
+            }
+            steps{
+                script{
+                    
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: "tedt-key", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh '''
+                        pwd
+                        cd us-west-2/development/"${cluster}"
+                        export AWS_REGION=us-west-2
+                        chmod +x sanity.sh
+                        chmod +x namespace_checks.sh
+                        chmod +x role_checks.sh
+                        #sh sanity.sh
+                        sh namespace_checks.sh
+                        sh role_checks.sh
+                        '''
+
+                    }
+                }
+            }
+        }
+
+
+        stage('Smoke Test for Fargate IPs '){
+            when {
+                beforeAgent true
+                expression {
+                    params.Plan == "fargate-smoke-test"
+                }
+            }
+            steps{
+                script{
+                    
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: "tedt-key", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh '''
+                        pwd
+                        cd us-west-2/development/"${cluster}"
+                        export AWS_REGION=us-west-2
+                        aws s3 cp s3://"${bucket}"/"${key}"/config ~/.kube/config
+                        export KUBECONFIG=~/.kube/config
+                        terraform init 
+                        terraform plan -target module.fargate-smoke-test -no-color
+                        terraform apply -target module.fargate-smoke-test -parallelism=1 -auto-approve -no-color
+                        chmod +x dep1.yaml
+                        echo "##### Deployment Begins #####"
+                        kubectl apply -f dep1.yaml -n fargate-test
+                        echo "##### Deployment ends ####"
+                        kubectl get deployments -n fargate-test | wc -l
+                        '''
+
+                    }
+                }
+            }
+        }
+
+        stage('terraform plan destroy'){
+            when {
+                beforeAgent true
+                expression {
+                    params.Plan == "destroy"
+                }
+            }
+            steps{
+                script{
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: "tedt-key", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh '''
+                           cd us-west-2/development/"${cluster}"
+                           export AWS_REGION=us-west-2
+                           aws s3 cp s3://"${bucket}"/"${key}"/config ~/.kube/config
+                           export KUBECONFIG=~/.kube/config
+                           terraform plan -target module.namespaces  -no-color -destroy
+                           terraform plan -target module.k8s-cluster -no-color -destroy
+                           '''
+                    }
+                }
+            }
+        }
+        
+        stage('approval for destroy') {
+            when {
+                beforeAgent true
+                expression {
+                    params.Plan == "destroy"
+                }
+            }
+            options {
+                timeout(time: 1, unit: 'HOURS')
+            }
+            steps {
+                input 'approve the plan to proceed and apply'
+            }
+        }
+        stage('terraform destroy') {
+            when {
+                beforeAgent true
+                expression {
+                    params.Plan == "destroy"
+                }
+            }
+            steps{
+                script{
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: "tedt-key", accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh ''' 
+                           cd us-west-2/development/"${cluster}"
+                           export AWS_REGION=us-west-2
+                           aws s3 cp s3://"${bucket}"/"${key}"/config ~/.kube/config
+                           export KUBECONFIG=~/.kube/config
+                           terraform destroy --auto-approve -no-color
+                        '''
+                    }
+                }
+            }
+        }
+     
+    }  
+}     
